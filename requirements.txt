@@ -1,0 +1,2 @@
+langchain-ollama==0.3.10
+langgraph==0.6.11
