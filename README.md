@@ -28,7 +28,8 @@
 - [8. Agent 是怎麼寫的](#8-agent-是怎麼寫的)
 - [9. Token 可觀測性原理](#9-token-可觀測性原理)
 - [10. 進階：接到正式的觀測系統](#10-進階接到正式的觀測系統)
-- [11. 疑難排解](#11-疑難排解)
+- [11. 如何評估 Agent：單元測試 vs Eval](#11-如何評估-agent單元測試-vs-eval)
+- [12. 疑難排解](#12-疑難排解)
 
 ---
 
@@ -211,11 +212,25 @@ langgraph==0.6.11
 ```
 qwen3.8-27b-tutorial/
 ├── README.md
-├── requirements.txt
-├── agent.py           # Agent 本體：模型設定、工具、執行進入點
-├── token_usage.py     # 可觀測性：token / 延遲 / 工具呼叫的 callback handler
-└── runs/usage.jsonl   # 執行後自動產生的事件紀錄（已加入 .gitignore）
+├── requirements.txt          # 執行 Agent 所需
+├── requirements-dev.txt      # 額外加上 pytest
+├── agent.py                  # Agent 本體：模型設定、工具、執行進入點
+├── token_usage.py            # 可觀測性：token / 延遲 / 工具呼叫的 callback handler
+├── tests/                    # 第 1、2 層：單元測試與接線測試（不需要 Ollama）
+│   ├── test_tools.py
+│   ├── test_token_usage.py
+│   ├── test_scorers.py
+│   └── test_agent_wiring.py
+├── evals/                    # 第 3 層：真的呼叫模型的評測
+│   ├── cases.py              # 評測資料集
+│   ├── scorers.py            # 評分函式
+│   ├── run_eval.py           # 執行器：跑資料集、算分、比對基準線
+│   └── baseline.json         # 基準線（納入版控，方便 review 分數變動）
+└── runs/usage.jsonl          # 執行後自動產生的事件紀錄（已加入 .gitignore）
 ```
+
+若只是要跑 Agent，`requirements.txt` 就夠了；要跑測試與評測請改裝 `requirements-dev.txt`。
+詳見 [第 11 節：如何評估 Agent](#11-如何評估-agent單元測試-vs-eval)。
 
 可用的環境變數：
 
@@ -448,7 +463,327 @@ usd = s["input_tokens"] / 1e6 * PRICE_IN + s["output_tokens"] / 1e6 * PRICE_OUT
 
 ---
 
-## 11. 疑難排解
+## 11. 如何評估 Agent：單元測試 vs Eval
+
+### 11.1 先分清楚：什麼能測、什麼只能評
+
+最容易踩的坑，是想用單元測試去測模型的回答。
+
+> **模型的輸出是不確定的，沒辦法斷言「等於」。**
+> 硬要這樣做，只會得到一個時好時壞的 flaky test，最後被整個團隊 skip 掉。
+
+正確的做法是把系統切成兩半：**確定性的部分用測試釘死，不確定的部分用 eval 量分數。**
+
+| 層次 | 問的問題 | 測的對象 | 需要模型？ | 速度 | 結果形式 | 何時跑 |
+|---|---|---|---|---|---|---|
+| **1. 單元測試** | 壞了沒？ | 工具、評分器、統計程式碼 | 否 | 毫秒 | pass / fail | 每次 commit |
+| **2. 接線測試** | 串對了沒？ | Agent 骨架（用假模型） | 假模型 | 毫秒 | pass / fail | 每次 commit |
+| **3. Eval 評測** | 現在多好？比上次好還壞？ | 模型的實際行為 | 是 | 分鐘 | 分數 / 通過率 | 改 prompt、換模型、發版前 |
+
+所以「這屬於單元測試嗎？」的答案是 **一半一半**：
+
+- 工具函式、token 統計、評分器、Agent 接線 → **是**，而且應該用最傳統的單元測試
+- 模型答得對不對、會不會亂用工具、會不會編造 → **不是測試，是 eval**
+
+三層在這個專案裡分別對應：
+
+```
+tests/test_tools.py         ← 第 1 層：工具是純函式，可斷言「等於」
+tests/test_token_usage.py   ← 第 1 層：統計元件（用假的 LLMResult）
+tests/test_scorers.py       ← 第 1 層：評分器本身
+tests/test_agent_wiring.py  ← 第 2 層：Agent 接線（用假模型）
+evals/                      ← 第 3 層：真的呼叫模型，算分數
+```
+
+```bash
+pip install -r requirements-dev.txt
+pytest                       # 第 1、2 層：50 個測試 0.24 秒跑完，不需要 Ollama
+python -m evals.run_eval     # 第 3 層：真的跑模型，約 1 分鐘
+```
+
+---
+
+### 11.2 第 1 層：單元測試 —— 測確定性的程式碼
+
+工具是純函式，可以用最傳統的方式測：
+
+```python
+@pytest.mark.parametrize("expression,expected", [
+    ("1 + 1", "2"),
+    ("1280 * 3 * 0.85", "3264.0"),
+])
+def test_算式正確求值(self, expression, expected):
+    assert calculate.invoke({"expression": expression}) == expected
+```
+
+有三類案例特別值得寫，因為它們對應的都是真實事故：
+
+**1) 工具的安全性 —— 模型的輸出等同不可信輸入**
+
+```python
+@pytest.mark.parametrize("expression", [
+    "__import__('os').system('ls')",
+    "open('/etc/passwd').read()",
+])
+def test_拒絕執行非算式內容(self, expression):
+    assert calculate.invoke({"expression": expression}).startswith("計算失敗")
+```
+
+**2) 錯誤要「講給模型聽」而不是拋出例外** —— 這是 Agent 能自我修正的前提：
+
+```python
+def test_除以零回傳錯誤訊息而非拋出例外(self):
+    assert calculate.invoke({"expression": "1 / 0"}).startswith("計算失敗")
+```
+
+**3) 統計元件本身** —— 統計出錯比功能出錯更危險，因為你會拿著錯的數字做決策而不自知：
+
+```python
+def test_多次呼叫會累加而非覆蓋(self):
+    h = TokenUsageCallbackHandler(verbose=False)
+    feed(h, make_result(input_tokens=100, output_tokens=20))
+    feed(h, make_result(input_tokens=150, output_tokens=30))
+    assert h.summary()["total_tokens"] == 300
+```
+
+`make_result()` 是手工組出來的假 `LLMResult`，完全不需要模型 —— 連
+「舊版沒有 `usage_metadata` 時退回讀 `prompt_eval_count`」這種平常走不到的防禦分支都測得到。
+
+---
+
+### 11.3 第 2 層：用假模型測 Agent 的「接線」
+
+這一層最容易被忽略，卻抓得到**最多**的 bug。
+
+模型本身不確定，但 **Agent 的骨架是確定性的**：工具有沒有註冊給模型、模型要求呼叫工具時
+有沒有真的被執行、工具結果有沒有送回模型、callback 有沒有被觸發、保險絲有沒有生效 ——
+這些跟模型聰不聰明完全無關，可以用一個按腳本回覆的假模型測到毫秒級。
+
+```python
+class FakeToolCallingModel(BaseChatModel):
+    """按照腳本依序回覆的假模型，用來精準控制 Agent 要走的路徑。"""
+    responses: List[AIMessage]
+    index: int = 0
+    bound_tools: List[str] = []
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        template = self.responses[min(self.index, len(self.responses) - 1)]
+        self.index += 1
+        response = template.model_copy(deep=True)
+        response.id = None       # ← 這行很關鍵，原因見下
+        return ChatResult(generations=[ChatGeneration(message=response)])
+
+    def bind_tools(self, tools, **kwargs):
+        self.bound_tools = [t.name for t in tools]
+        return self
+```
+
+有了它就能寫出 100% 穩定的斷言：
+
+```python
+def test_模型要求呼叫工具時工具真的被執行且結果回饋給模型(self):
+    model, agent = build([
+        ai_tool_call("calculate", {"expression": "1280 * 3 * 0.85"}),
+        ai_answer("總金額是 3264 元"),
+    ])
+    result = agent.invoke({"messages": [("user", "算一下")]})
+
+    tool_messages = [m for m in result["messages"] if isinstance(m, ToolMessage)]
+    assert [m.content for m in tool_messages] == ["3264.0"]          # 工具真的跑了
+    assert any(isinstance(m, ToolMessage) for m in model.seen_messages[1])  # 結果回饋了
+    assert result["messages"][-1].content == "總金額是 3264 元"
+```
+
+> **這一層在本專案實際抓到兩個坑，兩個都不是靠讀文件會發現的：**
+>
+> 1. **LangGraph 以 message id 判斷同一則訊息。** 假模型若每次回傳*同一個* `AIMessage`
+>    物件，第二次會變成「取代」而非「附加」，工具迴圈提早結束，測試假性通過。
+>    必須 `model_copy(deep=True)` 並把 `id` 清成 `None`。
+> 2. **`create_react_agent` 步數用盡時不會拋 `GraphRecursionError`**，而是優雅降級回
+>    一則普通訊息（"Sorry, need more steps..."）。如果你的程式碼在等一個例外來處理逾時，
+>    永遠等不到 —— 這種「不是錯誤但也不是正常結果」的狀況，只有寫測試才會發現。
+
+---
+
+### 11.4 第 3 層：Eval —— 量模型到底有多好
+
+**Eval 不是 pass/fail，是基準線。** 它的價值不在於某一次跑了幾分，
+而在於你改 prompt、換模型、調 `num_ctx` 之後，**跟上次比是進步還是退步、代價是多少**。
+
+#### 資料集
+
+Eval 的品質等於資料集的品質。每個案例都要有可自動判定的期望（`evals/cases.py`）：
+
+```python
+EvalCase(
+    id="multi-step",
+    question="3 台單價 1280 元的設備打 85 折後總共多少？這個金額有免運嗎？",
+    expect_contains=["3264", "免運"],          # 結果：答案該長什麼樣
+    expect_tools=["calculate", "search_policy"],  # 軌跡：過程該怎麼走
+    max_llm_calls=5,                           # 成本護欄
+),
+```
+
+挑案例的四個原則：
+
+1. 涵蓋**每一個工具**，以及**多工具組合**的情境
+2. 一定要有**不該用工具**的案例（`no-tool-needed`）—— Agent 最常見的毛病是濫用工具
+3. 一定要有**知識庫查不到**的案例（`not-in-kb`）—— 檢驗模型會不會編造答案
+4. 時間之類的動態答案，期望值要在執行時計算，不能寫死
+
+#### 三種評分方式，優先順序很明確
+
+> **能用程式判定的，絕不交給模型判定。** 規則式評分免費、瞬間完成、百分之百可重現；
+> LLM-as-judge 貴、慢，而且自己也會出錯。
+
+| 方式 | 適用 | 代價 |
+|---|---|---|
+| **規則比對** `score_contains` | 有標準答案（數字、日期、關鍵字） | 免費、瞬間 |
+| **軌跡評測** `score_tools` | Agent 專屬：該呼叫哪些工具 | 免費、瞬間 |
+| **成本護欄** `score_budget` | LLM 呼叫次數上限 | 免費、瞬間 |
+| **LLM-as-judge** `score_llm_judge` | 開放式判斷（有沒有編造事實） | 一次額外推論 |
+
+**軌跡評測是 Agent 評測與一般 LLM 評測最大的差別**，值得特別強調：
+
+```python
+def score_tools(used, expected, forbidden):
+    """「答案對但路徑錯」（例如沒查知識庫、憑記憶硬答）是最危險的假陽性 ——
+    這次矇對了，換個問題就會錯，而且你完全不知道為什麼。"""
+```
+
+用 judge 時只給它**二元判斷 + 明確準則**，不要叫它打 1~10 分（分數極不穩定），
+並且要把 judge 本身當成另一個需要被抽驗的元件。
+
+#### 執行與報告
+
+```bash
+python -m evals.run_eval                       # 跑全部
+python -m evals.run_eval --repeat 3            # 每題跑 3 次，量穩定度
+python -m evals.run_eval --judge               # 啟用 LLM-as-judge
+python -m evals.run_eval --save evals/baseline.json
+python -m evals.run_eval --compare evals/baseline.json
+```
+
+```
+==============================================================================
+評測報告　模型：qwen3.8:27b　每題執行次數：1
+==============================================================================
+case                 pass   tokens    sec  calls  失敗原因
+------------------------------------------------------------------------------
+policy-warranty     100%     1086    7.6    2.0
+calc-discount       100%     1155    9.6    2.0
+multi-step          100%     1980   15.7    3.0
+current-time        100%     1104    8.3    2.0
+no-tool-needed      100%      525    7.2    1.0
+not-in-kb           100%     1123   11.3    2.0
+------------------------------------------------------------------------------
+總計                100%     6973   59.7
+==============================================================================
+```
+
+注意報告把**正確率與成本並列** —— 因為 `token_usage.py` 的 tracker 直接被 eval 重複使用。
+一個「準確率不變但 token 翻倍」的改動，不是進步。
+
+#### 真實踩坑：第一次跑出 67%，但模型其實全對
+
+這份評測第一次執行的結果是這樣：
+
+```
+calc-discount         0%     1155   12.5    2.0  內容:缺少 ['3264']
+current-time          0%     1104    9.3    2.0  內容:缺少 ['2026-08-21']
+```
+
+實際去看模型的回答：
+
+```
+[calc-discount]  '3 台單價 1280 元、打 85 折後，總金額為 **3,264 元**。'
+[current-time]   '現在台北時間是 2026 年 8 月 21 日。'
+```
+
+**兩題都答對了**，是評分函式太死板：千分位逗號、中文日期寫法。
+這正是 eval 開發的日常 —— **評測跑出紅字時，第一件事是確認評分器有沒有問題，而不是急著怪模型。**
+
+解法是比對前先正規化，而且**兩邊套用同一個正規化**：
+
+```python
+def normalize(text):
+    t = re.sub(r"(?<=\d),(?=\d{3})", "", t)   # 3,264 → 3264
+    t = re.sub(r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日", ..., t)
+    return re.sub(r"[\s*_`]", "", t)          # 空白與 markdown 記號
+```
+
+但**正規化要保守**：拿掉太多東西會製造假陽性，讓錯的答案也通過。
+所以 `normalize()` 自己也有單元測試盯著（`tests/test_scorers.py`）：
+
+```python
+def test_不改動語意(self):
+    assert normalize("3265") != normalize("3264")
+```
+
+#### 回歸比對：這才是 eval 真正的用途
+
+有了基準線，就能量化任何改動的代價。實測「開啟 thinking 模式」：
+
+```
+與基準線比對：evals/baseline.json（基準模型：qwen3.8:27b）
+------------------------------------------------------------------------------
+policy-warranty   ! 變貴　通過率 100% → 100%　token 1086 → 1142 (+56)
+calc-discount     ! 變貴　通過率 100% → 100%　token 1155 → 1239 (+84)
+multi-step        ! 變貴　通過率 100% → 100%　token 1980 → 2107 (+127)
+current-time      ! 變貴　通過率 100% → 100%　token 1104 → 1209 (+105)
+no-tool-needed    ! 變貴　通過率 100% → 100%　token 525 → 572 (+47)
+not-in-kb         ! 變貴　通過率 100% → 100%　token 1123 → 1222 (+99)
+------------------------------------------------------------------------------
+```
+
+結論非常明確：**在這份資料集上，thinking 模式多花 7.4% token、多花 89% 時間
+（59.7s → 112.8s），正確率完全沒有提升。** 這類任務就該關掉 thinking。
+
+沒有 eval，這個決定只能靠感覺；有了 eval，它是一個有數字支撐的工程結論。
+（反過來說，這也代表資料集需要再加入真正需要多步推理的難題，才能測出 thinking 的價值 ——
+**eval 跑滿分通常不是好消息，而是代表題目太簡單。**）
+
+---
+
+### 11.5 該量哪些指標
+
+| 指標 | 為什麼重要 | 本專案來源 |
+|---|---|---|
+| **正確率 / 通過率** | 基本盤，但單看它會漏掉下面所有問題 | `pass_rate` |
+| **工具選擇準確率** | 答對但路徑錯 = 下次一定錯 | `score_tools` |
+| **平均 LLM 呼叫次數** | Agent 成本與延遲的主要驅動因子 | `avg_llm_calls` |
+| **平均 token** | 直接對應成本；換雲端模型時就是錢 | `avg_tokens` |
+| **延遲** | 使用者體感；本地模型尤其明顯 | `avg_seconds` |
+| **穩定度** | 同一題跑 N 次的通過率離散程度 | `--repeat` |
+
+### 11.6 常見陷阱
+
+| 陷阱 | 後果 | 做法 |
+|---|---|---|
+| 用單元測試斷言模型輸出 | flaky test，最後被整個 skip | 確定性部分才寫測試，其餘進 eval |
+| 只看最終答案，不看軌跡 | 放過「矇對」的假陽性 | 加上 `expect_tools` |
+| 叫 judge 打 1~10 分 | 分數飄移，無法比較 | 只做二元判斷 + 明確準則 |
+| 資料集只有 happy path | 上線才發現濫用工具、編造答案 | 一定要有「不該用工具」與「查不到」案例 |
+| 正規化過度 | 假陽性，錯的答案也通過 | 只處理格式，不碰語意，並為 `normalize()` 寫測試 |
+| eval 綁死 CI 要求 100% | 模型天生會抖，CI 永遠紅 | 用通過率門檻（如 `>= 90%`）與 `--repeat` |
+| 只比正確率不比成本 | 準確率持平但成本翻倍也看不出來 | 報告把 token 與延遲並列 |
+
+### 11.7 接進 CI
+
+`run_eval.py` 會以 exit code 回報結果，可以直接串進 pipeline：
+
+```yaml
+- run: pytest                              # 每次 push：快、不需要 Ollama
+- run: python -m evals.run_eval --repeat 3 # 每晚或發版前：需要 Ollama
+```
+
+實務建議是**兩段式**：第 1、2 層擋在每次 commit（0.24 秒，沒有理由不跑）；
+第 3 層跑得慢又需要模型，放在 nightly 或發版前，並且把基準線 JSON 納入版控，
+讓每次分數變動都能在 code review 中被看見。
+
+---
+
+## 12. 疑難排解
 
 | 問題 | 原因與處理 |
 |---|---|

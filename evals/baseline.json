@@ -1,0 +1,43 @@
+{
+  "model": "qwen3.8:27b",
+  "think": false,
+  "repeat": 1,
+  "results": {
+    "policy-warranty": {
+      "pass_rate": 1.0,
+      "avg_tokens": 1086,
+      "avg_seconds": 7.6,
+      "avg_llm_calls": 2
+    },
+    "calc-discount": {
+      "pass_rate": 1.0,
+      "avg_tokens": 1155,
+      "avg_seconds": 9.6,
+      "avg_llm_calls": 2
+    },
+    "multi-step": {
+      "pass_rate": 1.0,
+      "avg_tokens": 1980,
+      "avg_seconds": 15.7,
+      "avg_llm_calls": 3
+    },
+    "current-time": {
+      "pass_rate": 1.0,
+      "avg_tokens": 1104,
+      "avg_seconds": 8.3,
+      "avg_llm_calls": 2
+    },
+    "no-tool-needed": {
+      "pass_rate": 1.0,
+      "avg_tokens": 525,
+      "avg_seconds": 7.2,
+      "avg_llm_calls": 1
+    },
+    "not-in-kb": {
+      "pass_rate": 1.0,
+      "avg_tokens": 1123,
+      "avg_seconds": 11.3,
+      "avg_llm_calls": 2
+    }
+  }
+}
